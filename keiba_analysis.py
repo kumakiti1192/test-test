@@ -262,7 +262,12 @@ def scrape_race_ids_one_day(
     if not ids:
         logging.warning(f"[{date}] requests 0 件 ⇒ Selenium fallback")
         drv = prepare_chrome_driver(headless=True, no_images=True)
-        ok = safe_driver_get(drv, url, wait_xpath='//a[contains(@href,"race_id=")]')
+        ok = safe_driver_get(
+            drv,
+            url,
+            wait_xpath='//a[contains(@href,"race_id=")]',
+            use_network_idle=False,
+        )
         if ok:
             html = drv.page_source
             ids = re.findall(pat, html) or re.findall(
@@ -382,7 +387,7 @@ def get_race_results_with_odds(rid: str, driver: Optional[uc.Chrome] = None) -> 
             driver.quit()
 
     order = [
-        int(tr.find_all("td")[0].get_text(strip=True))
+        int(tr.find_all("td")[2].get_text(strip=True))
         for tr in soup.select(".RaceTable01 tr")[1:4]
     ]
     payout = parse_payout_table(soup)
