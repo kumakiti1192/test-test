@@ -1,0 +1,1250 @@
+#!/usr/bin/env python
+# coding: utf-8
+# ============================================================
+#  JRA 競馬予測パイプライン  ―  フルクリーン版 2025-05-13
+#    * 正規表現 4 箇所強化
+#    * loky 例外フォールバック付き
+#    * CPU 使用率 = CPU_RATIO (%)
+# ============================================================
+_uc_driver_cached = None 
+# ----------------- Imports ----------------------------------
+# ----------------- Imports ----------------------------------
+import os, re, time, random, logging, warnings, signal, subprocess, platform, pickle, datetime as dt
+from pathlib import Path
+from typing import Sequence, Callable, Optional
+import numpy as np
+import pandas as pd
+from tqdm.notebook import tqdm                       # ← 既存
+from bs4 import BeautifulSoup
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui  import WebDriverWait
+from selenium.webdriver.support      import expected_conditions as EC
+from selenium.common.exceptions      import TimeoutException
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor    # ★ 追加
+from joblib import Parallel, delayed
+import lightgbm as lgb
+from queue import SimpleQueue
+import multiprocessing as mp
+from contextlib import contextmanager
+from joblib import Memory
+
+import multiprocessing as mp
+if mp.get_start_method(allow_none=True) != "spawn":
+    mp.set_start_method("spawn", force=True)
+
+memory = Memory("cache/horse_parse", verbose=0)
+
+
+# ----------------- 基本設定 --------------------------------
+TRAIN_MODE  = True                       # False で PREDICT
+ANSWER_CHECK_ENABLED = True
+FROM_YYYMMM = "2024-01"
+TO_YYYMMM   = "2025-04"
+RACE_DATE   = "20250427"
+CPU_RATIO   = 0.8                        # 並列度＝CPU×80%
+
+DIR_HTML_RACE   = Path("html/race")
+DIR_HTML_HORSE  = Path("html/horse")
+DIR_HTML_RESULT = Path("html/race_result")
+DIR_DATA        = Path("data")
+DIR_MODEL       = Path("models")
+DIR_OUTPUT      = Path("output")
+
+PKL_RESULT      = DIR_DATA / "df_result.pkl"
+PKL_HORSE_ALL   = DIR_DATA / "df_horse_all.pkl"
+PKL_PAST5       = DIR_DATA / "df_past5.pkl"
+PKL_JOCKEY      = DIR_DATA / "df_jockey.pkl"
+MODEL_FILE      = DIR_MODEL / "model_jra.txt"
+RESULT_HTML_DIR = DIR_HTML_RESULT            # 既存と統一
+DIST_CAT_BINS   = [0, 1400, 1800, 2200, 3000, 9999]
+DIST_CAT_LABELS = ["S", "M", "IM", "L", "EL"]
+
+# ----------------- ロギング --------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+uc.logger.setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=".*could not detect.*")
+
+# ----------------- tqdm ラッパー（再帰バグ修正） -------------
+def tqdm_notebook(*args, **kwargs):
+    """
+    tqdm.notebook を `disable=False` 固定でラップ。
+    例) for x in tqdm_notebook(iterable, desc="説明"):
+    """
+    kwargs.setdefault("disable", False)
+    return tqdm(*args, **kwargs)        # ★ 自分自身を呼ばない
+
+# ============================================================
+#  PART-1 : Chrome Driver / GET / HTML 保存ユーティリティ
+# ============================================================
+UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_2) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ",
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+]
+def random_ua() -> str: return random.choice(UA_POOL)
+
+def kill_zombie_chrome():
+    if platform.system() != "Windows":
+        return
+    try:
+        out = subprocess.check_output("tasklist").decode(errors="ignore")
+        for line in out.splitlines():
+            if re.search(r"(chrome|chromedriver|msedge)", line, re.I):
+                os.kill(int(line.split()[1]), signal.SIGTERM)
+    except Exception:
+        pass
+
+
+def prepare_chrome_driver(
+    *, headless: bool=True, no_images: bool=False,
+    version_main: int=135, max_retry: int=4
+):
+    def _kill(pattern=r"(chrome|chromedriver)"):
+        if platform.system() != "Windows": return
+        try:
+            out = subprocess.check_output("tasklist").decode(errors="ignore")
+            for ln in out.splitlines():
+                if re.search(pattern, ln, re.I):
+                    os.kill(int(ln.split()[1]), signal.SIGTERM)
+        except Exception: pass
+
+    global _uc_driver_cached
+    for att in range(1, max_retry+1):
+        try:
+            _kill(); time.sleep(0.8)
+            opt = uc.ChromeOptions()
+            opt.add_argument(f"--user-agent={random_ua()}")
+            if headless: opt.add_argument("--headless=new")
+            for flag in ("--disable-gpu","--no-sandbox","--disable-dev-shm-usage",
+                         "--disable-blink-features=AutomationControlled","--remote-debugging-port=0"):
+                opt.add_argument(flag)
+            if no_images:
+                opt.add_experimental_option("prefs",{"profile.managed_default_content_settings.images":2})
+            kw = dict(options=opt, patcher_force_close=True,
+                      version_main=version_main, log_level=3, timeout=90)
+            if _uc_driver_cached:
+                kw["driver_executable_path"] = str(_uc_driver_cached)
+            driver = uc.Chrome(**kw)
+            if _uc_driver_cached is None:
+                _uc_driver_cached = Path(driver.service.path).resolve()
+            driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"}
+            )
+            logging.info("[Driver] Chrome 起動成功")
+            return driver
+        except Exception as e:
+            logging.warning(f"[Driver Retry {att}] {e}")
+            _kill(); time.sleep(2+random.random())
+    raise RuntimeError("Chrome 起動失敗")
+
+NETWORK_IDLE_JS = """
+return (function(sec){
+  const now=performance.now();
+  const recent=performance.getEntriesByType('resource')
+               .filter(r=>(now-r.responseEnd)<(sec*1000));
+  return recent.length===0;})(arguments[0]);
+"""
+
+def safe_driver_get(
+    driver, url:str, *, wait_xpath:str|None=None,
+    timeout:int=45, quiet_sec:int=2, max_retry:int=3,
+    extra_wait:Optional[Callable]=None
+) -> bool:
+    for att in range(1,max_retry+1):
+        try:
+            driver.set_page_load_timeout(timeout)
+            driver.get(url)
+            WebDriverWait(driver, timeout).until(lambda d: d.execute_script("return document.readyState")=="complete")
+            if wait_xpath:
+                WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.XPATH,wait_xpath)))
+            if extra_wait:
+                WebDriverWait(driver, timeout).until(extra_wait)
+            WebDriverWait(driver, timeout).until(lambda d: d.execute_script(NETWORK_IDLE_JS, quiet_sec))
+            return True
+        except Exception as e:
+            logging.warning(f"[GET-Retry {att}/{max_retry}] {url} → {e.__class__.__name__}")
+            time.sleep(2+random.random())
+    return False
+
+def safe_driver_get_multi(
+    driver, url:str, *, wait_xpaths:Sequence[str],
+    timeout:int=45, max_retry:int=3, extra_wait:Optional[Callable]=None
+) -> bool:
+    cond = EC.any_of(*[EC.presence_of_element_located((By.XPATH,x)) for x in wait_xpaths])
+    for att in range(1,max_retry+1):
+        try:
+            driver.set_page_load_timeout(timeout); driver.get(url)
+            WebDriverWait(driver, timeout).until(cond)
+            if extra_wait: WebDriverWait(driver, timeout).until(extra_wait)
+            WebDriverWait(driver, timeout).until(lambda d: d.execute_script("return document.readyState")=="complete")
+            return True
+        except Exception as e:
+            logging.warning(f"[GET-Retry {att}/{max_retry}] {url} → {e.__class__.__name__}")
+            time.sleep(2+random.random())
+    return False
+
+# -- ❶ 正規表現①  looks_like_result_html  キーワード&テーブル検出 ---------
+def looks_like_result_html(html: str) -> bool:
+    if ("着順" not in html) or ("馬名" not in html):
+        return False
+    return ('id="All_Result_Table"' in html or 
+            'class="RaceTable01"'   in html or    # 旧テーブル
+            'class="RaceTable02"'   in html or    # 新テーブル
+            'class="ResultTableWrap"' in html)    # 予備
+
+def is_valid_result_html(path: Path, min_kb:int=50) -> bool:
+    if not path.exists() or path.stat().st_size < min_kb*1024: return False
+    try: return looks_like_result_html(path.read_text("utf-8","ignore"))
+    except Exception: return False
+
+def ensure_html(
+    path:Path, url:str, *, wait_xpaths:Optional[Sequence[str]]=None,
+    no_images:bool=False, timeout:int=60, max_retry:int=4
+)->bool:
+    if is_valid_result_html(path): return True
+    if path.exists(): path.unlink(missing_ok=True)
+    wait_xpaths = wait_xpaths or ['//*[@id="All_Result_Table"]',
+                                  '//*[@class="RaceTable01"]',
+                                  '//*[@class="RaceTable02"]',
+                                  '//*[@class="ResultTableWrap"]']
+    for att in range(1,max_retry+1):
+        drv = prepare_chrome_driver(headless=True,no_images=no_images)
+        ok  = safe_driver_get_multi(drv,url,wait_xpaths=wait_xpaths,
+                                    timeout=timeout,max_retry=1)
+        html=drv.page_source if ok else ""; drv.quit()
+        if ok and looks_like_result_html(html):
+            path.write_bytes(html.encode("utf-8")); return True
+        logging.warning(f"[ensure] retry {att}/{max_retry} → {url}")
+    logging.error(f"[ensure] GIVE-UP: {url}"); return False
+
+def save_pickle_safe(obj,path:Path):
+    tmp=path.with_suffix(".tmp"); pickle.dump(obj,tmp.open("wb")); tmp.replace(path)
+def load_pickle_safe(path:Path):
+    try:
+        with open(path,"rb") as f: data=pickle.load(f)
+        if isinstance(data,list) and len(data)%12!=0:
+            logging.warning(f"[CACHE] {path.name} 破棄"); path.unlink(); return None
+        return data
+    except Exception:
+        path.unlink(missing_ok=True); return None
+
+# ============================================================
+#  PART-2 : race_id / calendar / HTML 取得
+# ============================================================
+
+# ---------- 1. race_id 取得 ---------------------------------
+def scrape_race_ids_one_day(
+        kaisai_date: str,
+        cache_dir: Path = Path("cache/race_ids"),
+        force_update: bool = False) -> list[str]:
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cfile = cache_dir / f"race_ids_{kaisai_date}.pkl"
+    if not force_update and cfile.exists():
+        if (ids := load_pickle_safe(cfile)) is not None:
+            logging.info(f"[CACHE] {kaisai_date} race_id {len(ids)} 件")
+            return ids
+
+    url = f"https://race.netkeiba.com/top/race_list.html?kaisai_date={kaisai_date}"
+    r = requests.get(url,
+                     headers={"User-Agent": "Mozilla/5.0"},
+                     timeout=20)
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "lxml")
+    ids: list[str] = [
+        m.group(1) for a in soup.select('.RaceList_DataWrap a[href*="race_id="]')
+        if (m := re.search(r'race_id=(\d{12})', a["href"]))
+    ]
+
+    ids = sorted(set(ids))
+    if len(ids) % 12 != 0:
+        logging.warning(f"[race_list] {kaisai_date} → {len(ids)} 件 (不完全) 破棄")
+        return []
+
+    save_pickle_safe(ids, cfile)
+    logging.info(f"[race_list] {kaisai_date}: {len(ids)} 件")
+    return ids
+
+# ---------- 2. 開催日カレンダー --------------------------------------------
+def scrape_kaisai_date_selenium(from_yyyymm: str, to_yyyymm: str) -> list[str]:
+    CAL = "https://race.netkeiba.com/top/calendar.html"
+    rng = pd.date_range(f"{from_yyyymm}-01", f"{to_yyyymm}-28", freq="M")
+    driver = prepare_chrome_driver(headless=True, no_images=True)
+    dates: list[str] = []
+    for y, m in tqdm_notebook(zip(rng.year, rng.month), total=len(rng), desc="calendar"):
+        driver.get(f"{CAL}?year={y}&month={m:02d}")
+        try:
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "Calendar_Table"))
+            )
+            for a in driver.find_elements(By.XPATH,
+                    '//table[@class="Calendar_Table"]//a'):
+                href = a.get_attribute("href") or ""
+                m = re.search(r"kaisai_date=(\d{8})", href)
+                if m: dates.append(m.group(1))
+        except Exception: pass
+    driver.quit()
+    dates = sorted(set(dates))
+    logging.info(f"[開催日] {len(dates)} 日")
+    return dates
+
+# ============================================================
+# 3. RESULT HTML バルク取得
+# ============================================================
+def _need_download(rid: str) -> bool:
+    f = DIR_HTML_RESULT / f"race_{rid}.bin"
+    try:
+        return (not f.exists()) or f.stat().st_size < 50_000
+    except Exception:
+        return True
+
+
+def fetch_result_html_bulk(race_ids: list[str], max_workers: int = 12) -> None:
+    need_dl: list[str] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as exe:
+        fut = {exe.submit(_need_download, rid): rid for rid in race_ids}
+        for f in tqdm_notebook(as_completed(fut), total=len(race_ids),
+                      desc="integrity", leave=False):
+            if f.result():
+                need_dl.append(fut[f])
+
+    ok_cnt = len(race_ids) - len(need_dl)
+    logging.info(f"[RESULT HTML] DL 予定 = {len(need_dl)} / OK = {ok_cnt}")
+    if not need_dl:
+        return
+
+    for rid in tqdm_notebook(need_dl, desc="download result html"):
+        ensure_html(
+            path=DIR_HTML_RESULT / f"race_{rid}.bin",
+            url=f"https://race.netkeiba.com/race/result.html?race_id={rid}",
+            wait_xpaths=['//*[@id="All_Result_Table"]',
+                         '//*[@class="RaceTable01"]',
+                         '//*[@class="RaceTable02"]',
+                         '//*[@class="ResultTableWrap"]'],
+            no_images=True
+        )
+
+# ============================================================
+# result.html → DataFrame  ―  v4  (空白除去で列名を正規化)
+# ============================================================
+def parse_result_html(path: Path) -> pd.DataFrame:
+    """
+    race_XXXXXXXXXXXX.bin → 成績 DataFrame
+
+    ・MultiIndex ヘッダで ('着','順') など分割されても着順列を認識
+    ・列ラベルの全角／半角スペースをすべて除去して正規化
+    ・「馬番」列が無ければ 3 列目を補完（全角数字→半角変換付き）
+    """
+    if not path.is_file():
+        return pd.DataFrame()
+
+    html = path.read_text("utf-8", "ignore")
+    soup = BeautifulSoup(html, "lxml")
+
+    # ---------- テーブル取得 ------------------------------------
+    tbl = (soup.select_one("#All_Result_Table") or
+           soup.select_one("table.Result_Table") or
+           soup.select_one("table.RaceTable01")  or
+           soup.select_one("table.RaceTable02"))
+    if tbl is None:
+        for t in soup.find_all("table"):
+            if "着" in t.get_text() and "順" in t.get_text():
+                tbl = t
+                break
+    if tbl is None:
+        return pd.DataFrame()
+
+    # ---------- ヘッダ候補を総当たり -----------------------------
+    def _has_chakujun(df: pd.DataFrame) -> bool:
+        for col in df.columns:
+            label = "".join(map(str, col)) if isinstance(col, tuple) else str(col)
+            if ("着" in label) and ("順" in label):
+                return True
+        return False
+
+    df = None
+    for hdr in (None, 0, 1):
+        try:
+            cand = pd.read_html(str(tbl), flavor="bs4", header=hdr)[0]
+            if _has_chakujun(cand):
+                df = cand
+                break
+        except Exception:
+            continue
+    if df is None:
+        return pd.DataFrame()
+
+    # ---------- ★ 列ラベルを正規化（空白削除） --------------------
+    def _clean_label(col) -> str:
+        s = "".join(map(str, col)) if isinstance(col, tuple) else str(col)
+        return re.sub(r"\s+", "", s)
+
+    df.columns = [_clean_label(c) for c in df.columns]
+
+    # ---------- 馬番補完（3 列目を解析） -------------------------
+    if "馬番" not in df.columns and df.shape[1] >= 3:
+        umaban = []
+        for tr in BeautifulSoup(str(tbl), "lxml").select("tr")[1:]:
+            tds = tr.find_all(["td", "th"])
+            txt = re.sub(r"\s+", "", tds[2].get_text()) if len(tds) >= 3 else ""
+            txt = txt.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+            m = re.match(r"^\d{1,2}$", txt)
+            umaban.append(int(m.group()) if m else None)
+        if len(umaban) == len(df):
+            df.insert(2, "馬番", umaban)
+
+    # ---------- ID 抽出 ------------------------------------------
+    hids = re.findall(r"/horse/(\d{5,10})", str(tbl))
+    jids = re.findall(r"/jockey/(?:result/[^/]+/|profile/|detail/)?(\d+)", str(tbl))
+    n = len(df)
+    hids += [None] * (n - len(hids))
+    jids += [None] * (n - len(jids))
+
+    df = df.iloc[:n].copy()
+    df["horse_id"]  = hids[:n]
+    df["jockey_id"] = jids[:n]
+    df["race_id"]   = path.stem[5:17]          # race_YYYYMMDDHHMM
+
+    # ---------- 数値列へ変換 -------------------------------------
+    for col in ("着順", "枠番", "馬番", "人気"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # ---------- 列フィルタ ---------------------------------------
+    keep = ["race_id", "horse_id", "jockey_id",
+            "着順", "枠番", "馬番", "人気"]
+    return df[[c for c in keep if c in df.columns]]
+
+
+# ============================================================
+# 5. プロセス並列パース  (堅牢版 ＋ fallback)
+# ============================================================
+
+class SkipThisRace(Exception):
+    """成績テーブルが得られずスキップしたい場合に送出"""
+
+def parse_one_result_html(file_path: str | Path) -> pd.DataFrame:
+    """単一ファイルをパース。データが無ければ SkipThisRace"""
+    df = parse_result_html(Path(file_path))
+    if df.empty:
+        raise SkipThisRace
+    return df
+
+# ============================================================
+# 5. プロセス並列パース  (堅牢版＋future→rid マッピング修正版)
+# ============================================================
+def parse_result_html_bulk_loky(race_ids, html_dir, max_workers=None):
+    """
+    race_ids に対応する result.html をマルチスレッドでパース。
+    - 失敗した race_id は skipped に入れる
+    - NameError 回避のため future→race_id マップを保持
+    """
+    def _one(rid: str) -> pd.DataFrame | None:
+        file = os.path.join(html_dir, f"race_{rid}.bin")
+        try:
+            return parse_one_result_html(file)
+        except SkipThisRace:
+            return None
+
+    ok_df, skipped = [], []
+    max_workers = max_workers or os.cpu_count()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex, \
+         tqdm_notebook(total=len(race_ids), desc="result-parse", unit="R") as bar:
+
+        future_map = {ex.submit(_one, rid): rid for rid in race_ids}
+
+        for fut in as_completed(future_map):
+            rid = future_map[fut]                     # ← これで NameError 解消
+            bar.update()
+            df = fut.result()
+            if df is None:
+                skipped.append(rid)
+            else:
+                ok_df.append(df)
+
+    return pd.concat(ok_df, ignore_index=True) if ok_df else pd.DataFrame(), skipped
+
+
+# ============================================================
+# 6. horse HTML 取得 & パース
+# ============================================================
+def is_valid_horse_html(path: Path,
+                        min_size: int = 5_000,
+                        must_have: tuple[str, ...] = ("着順",)):
+    if not path.is_file(): return False
+    if path.stat().st_size < min_size:
+        logging.debug(f"[horse-html] too small {path.name}")
+        return False
+    try:
+        html = path.read_text("utf-8", "ignore")
+    except Exception:
+        return False
+    compact = html.replace(" ", "").replace("　", "")
+    return all(k.replace(" ", "").replace("　", "") in compact for k in must_have)
+
+def download_horse_page(driver, horse_id: str, retries: int = 1) -> bool:
+    fpath = DIR_HTML_HORSE / f"horse_{horse_id}.bin"
+    if is_valid_horse_html(fpath):
+        return True
+    url = f"https://db.netkeiba.com/horse/{horse_id}/"
+    ok = safe_driver_get(driver, url, wait_xpath='//*[@id="db_main_box"]',
+                         timeout=60, max_retry=retries)
+    if not ok:
+        return False
+    html = driver.page_source
+    if "馬名" not in html:
+        return False
+    fpath.write_bytes(html.encode("utf-8"))
+    return True
+
+from concurrent.futures import ThreadPoolExecutor
+
+def scrape_horse_pages_bulk(horse_ids: list[str], retry_max: int = 2):
+    """
+    ① ローカル HTML の存在・妥当性チェックをマルチスレッドで高速化
+    ② ダウンロード対象だけ Selenium で取得
+    """
+    # ---------- ① 既存チェック（I/O バウンドなのでスレッド並列） ----------
+    def _need(hid: str) -> str | None:
+        f = DIR_HTML_HORSE / f"horse_{hid}.bin"
+        return hid if not is_valid_horse_html(f) else None
+
+    # 32 スレッド程度なら CPU 使用率はほぼ増えず、ディスク I/O が大幅短縮
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        targets = [hid for hid in ex.map(_need, horse_ids) if hid]
+
+    ok_cnt = len(horse_ids) - len(targets)
+    logging.info(f"[horse] 👍既存OK = {ok_cnt:,}  /  DL予定 = {len(targets):,}")
+    if not targets:
+        return
+
+    # ---------- ② ダウンロード（従来どおり単一 Chrome で順次） ----------
+    driver = prepare_chrome_driver(headless=True, no_images=True)
+    err = 0
+    for hid in tqdm_notebook(targets, desc="horse"):
+        if download_horse_page(driver, hid, retry_max):
+            err = 0
+        else:
+            err += 1
+            logging.warning(f"[horse] ❌ {hid}")
+        if err >= 3:                          # 3 連続失敗で Chrome 再起動
+            driver.quit()
+            driver = prepare_chrome_driver(headless=True, no_images=True)
+            err = 0
+    driver.quit()
+
+
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    colmap = {}
+    for c in df.columns:
+        cc = re.sub(r"\s+", "", str(c))
+        if re.fullmatch(r"(日付|開催日|年月日)", cc):      colmap[c] = "race_date"
+        elif "着順" in cc:                                colmap[c] = "着順"
+        elif re.search(r"(上り|上がり).?3?F?", cc):       colmap[c] = "上がり3F"
+        elif re.search(r"(馬体重|体重)", cc):             colmap[c] = "馬体重"
+        elif re.search(r"(馬場|コース|種別)", cc):        colmap[c] = "馬場種別"
+        elif re.search(r"(開催|競馬場)", cc):             colmap[c] = "開催"
+        elif "race_id" in cc.lower():                     colmap[c] = "race_id"
+    df = df.rename(columns=colmap)
+
+    for col in ["race_date", "着順", "上がり3F", "馬体重", "馬場種別"]:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    df["race_date"] = pd.to_datetime(df["race_date"], errors="coerce")
+    df["着順"]      = pd.to_numeric(df["着順"].astype(str).str.extract(r"(\d+)")[0],
+                                 errors="coerce")
+    df["上がり3F"]  = pd.to_numeric(df["上がり3F"].astype(str)
+                                 .str.replace("秒", ""), errors="coerce")
+    df["馬体重"]    = pd.to_numeric(df["馬体重"].astype(str)
+                                 .str.extract(r"(\d+)")[0], errors="coerce")
+
+    def _track(x):
+        if isinstance(x, str):
+            if "芝" in x: return "芝"
+            if "ダ" in x or "砂" in x or "ダート" in x: return "ダ"
+        return pd.NA
+    df["馬場種別"] = df["馬場種別"].apply(_track)
+
+    if "race_id" not in df.columns:
+        df["race_id"] = pd.NA
+
+    # === 🆕 追加ここから =================================================
+    # 同じ列ラベルが複数ある場合は、先頭列のみ残して重複を除去
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()]
+    # === 🆕 追加ここまで =================================================
+
+    return df
+
+
+# -------------------------------------------------------------
+#  単一馬ページ HTML バイト列 → DataFrame  （キャッシュ付き）
+# -------------------------------------------------------------
+# ==== 置換対象: _parse_html_bytes_raw 関数 ====
+def _parse_html_bytes_raw(html_bytes: bytes, hid: str) -> pd.DataFrame:
+    """Horse-page <table> → DataFrame   (改行入りヘッダ完全対応版)"""
+    soup = BeautifulSoup(html_bytes, "lxml")
+
+    # 1) table 抽出 ----------------------------------------------------------------
+    tbl = (soup.select_one("#All_Result_Table")
+           or soup.select_one("table.RaceTable01")
+           or soup.select_one("table.RaceTable02")
+           or soup.select_one("table.db_h_race_results")       # ★ main
+           or soup.select_one("table.HorseRaceTable")
+           or soup.select_one("table.HorseRaceTable01")
+           or soup.select_one("table.HorseRaceTable02"))
+    if tbl is None:
+        raise ValueError("成績テーブル未検出")
+
+    # 2) pandas.read_html ― ヘッダ総当たり -----------------------
+    def has_chakujun(df: pd.DataFrame) -> bool:
+        """列に ‘着’ と ‘順’ の両方を含むセルがあれば OK"""
+        for col in df.columns:
+            txt = "".join(map(str, col)) if isinstance(col, tuple) else str(col)
+            if "着" in txt and "順" in txt:
+                return True
+        return False
+
+    df_final = None
+    for hdr in (None, 0, 1):
+        for flavor in ("lxml", "bs4"):
+            try:
+                # ★ match を外し、全テーブル取得
+                cand_list = pd.read_html(str(tbl), flavor=flavor, header=hdr)
+            except ValueError:
+                continue
+            for cand in cand_list:
+                if has_chakujun(cand) and cand.shape[0] >= 3:
+                    df_final = cand
+                    break
+            if df_final is not None:
+                break
+        if df_final is not None:
+            break
+
+    if df_final is None:
+        raise ValueError("着順列を含むテーブルが解析できません")
+
+    # 3) 馬番列が無ければ 3 列目を補完 ---------------------------
+    if "馬番" not in df_final.columns and df_final.shape[1] >= 3:
+        nums = []
+        for tr in tbl.find_all("tr")[1:]:
+            tds = tr.find_all(["td", "th"])
+            raw = tds[2].get_text(" ", strip=True) if len(tds) >= 3 else ""
+            num = re.sub(r"\D", "", raw.translate(str.maketrans("０１２３４５６７８９",
+                                                                "0123456789")))
+            nums.append(int(num) if num else None)
+        if len(nums) == len(df_final):
+            df_final.insert(2, "馬番", nums)
+
+    # 4) 共通整形 ------------------------------------------------
+    df_final = _normalize_columns(df_final)
+    df_final["horse_id"] = hid
+    return df_final
+
+
+# ------------ 一括解析 -------------------------------------------------
+def parse_horse_data_all(horse_ids: list[str],
+                         max_workers: int | None = None) -> pd.DataFrame:
+    """
+    HTML をメインプロセスで読み、そのバイト列を loky プロセスへ渡す。
+    テーブルが見つからない馬はスキップして続行する。
+    """
+    # --- 1) HTML 読み込み (I/O) --------------------------------
+    paths = [DIR_HTML_HORSE / f"horse_{hid}.bin" for hid in horse_ids]
+
+    def _load_bytes(path: Path):
+        if not is_valid_horse_html(path):
+            raise FileNotFoundError(path.name)
+        return path.read_bytes(), path.stem[6:]  # (bytes, horse_id)
+
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        tasks = list(ex.map(_load_bytes, paths))
+
+    # --- 2) 多プロセスパース (CPU) ------------------------------
+    max_workers = max_workers or max(1, int(os.cpu_count() * CPU_RATIO))
+    logging.info(f"[horse-parse] fork workers = {max_workers}")
+
+    # ★ 追加: 例外を飲み込んで None を返す安全ラッパー ----------
+    def _safe_parse(html, hid):
+        try:
+            return _parse_html_bytes_raw(html, hid)   # 元パーサ
+        except Exception as e:
+            logging.debug(f"[horse-miss] {hid} ⇢ {e}")
+            return None                                # スキップ扱い
+
+    results = Parallel(
+        n_jobs=max_workers, backend="loky", prefer="processes"
+    )(
+        delayed(_safe_parse)(html, hid)
+        for html, hid in tqdm_notebook(tasks, desc="horse-parse", unit="頭")
+    )
+
+    # ★ 変更: OK/NG を振り分けて NG は警告のみ -------------------
+    ok = [df for df in results if isinstance(df, pd.DataFrame)]
+    ng = len(results) - len(ok)
+    if not ok:
+        raise RuntimeError("全頭失敗: 成績テーブルが検出できませんでした")
+    if ng:
+        logging.warning(f"[horse] テーブル未検出スキップ = {ng} 頭")
+
+    return pd.concat(ok, ignore_index=True)
+
+
+# %% 区間タイム・脚質特徴量  -------------------------------
+
+# =========================  race passing-order → 脚質分類  =========================
+def classify_style_by_passing(passing: str, head: int) -> str | None:
+    """
+    通過順文字列（例: '1-1-1-2' や '5-5-3-1'）と頭数から
+    ['逃げ','逃げバテ','先行','差し','追込'] のいずれかを返す
+      * head : そのレースの出走頭数
+    戻り値が None のときは判定保留
+    """
+    if not passing or head <= 0:
+        return None
+
+    # ① 4 区間の順位リストを確保（欠損は末尾値で埋める）
+    pos = [int(p) for p in re.split(r"[^\d]+", passing) if p.isdigit()]
+    if not pos:
+        return None
+    pos = (pos + [pos[-1]] * 4)[:4]              # 要素不足を補完
+    p1, p2, p3, p4 = pos
+
+    # ② 割合に直してロジック判定
+    r1, r24, r4 = p1 / head, (p2 + p3) / 2 / head, p4 / head
+    if r1 <= 0.10:                                # 発馬で先頭 10 % 以内
+        return "逃げ"       if r4 <= 0.50 else "逃げバテ"
+    if r1 <= 0.25 and r4 <= 0.40:
+        return "先行"
+    if r4 < r1:
+        return "差し"
+    if r1 >= 0.66 and r4 >= 0.66:
+        return "追込"
+    return None
+
+
+def _load_result_html(rid: str) -> str:
+    path = RESULT_HTML_DIR / f"race_{rid}.bin"
+    return path.read_text("utf-8", "ignore")
+
+def _parse_section(html: str, umaban: int):
+    """
+    1 レース HTML から
+      ・その馬の上がり 3F 順位 (rk)
+      ・脚質ラベル (st)
+    を抽出して返す。失敗時は (None, None)。
+    ★ passing‐order 解析を追加
+    """
+    soup = BeautifulSoup(html, "lxml")
+    tbl  = (soup.select_one("#All_Result_Table")
+            or soup.select_one("table.RaceTable01")
+            or soup.select_one("table.RaceTable02"))
+    if tbl is None:
+        return None, None
+
+    # ---------- DataFrame 化 ----------  
+    try:
+        df = pd.read_html(str(tbl), flavor="lxml", header=0)[0]
+    except Exception:
+        return None, None
+
+    # 頭数・対象行
+    head = len(df)
+    row  = df[df.get("馬番").astype(str) == str(umaban)]
+    if row.empty:
+        return None, None
+
+    # ---------- 上がり 3F 順位 ----------  
+    if "上り" in df.columns:
+        df["上がり順"] = pd.to_numeric(df["上り"], errors="coerce").rank(method="min")
+        rk = int(row["上がり順"].iloc[0]) if pd.notna(row["上がり順"].iloc[0]) else None
+    else:
+        rk = None
+
+    # ---------- 脚質判定（passing order 文字列） ----------  
+    passing_col = None
+    for cand in ("通過", "コーナー通過順"):      # 表記ゆれ対応
+        if cand in df.columns:
+            passing_col = cand; break
+    st = None
+    if passing_col:
+        passing = str(row[passing_col].iloc[0])
+        st = classify_style_by_passing(passing, head)
+
+    return rk, st
+
+
+# -----------------------------------------------------------
+# collect_section_features  ― 0 件なら空 DF を返して警告
+# -----------------------------------------------------------
+def collect_section_features(df_hist: pd.DataFrame,
+                             umaban_map: dict[tuple[str, str], int],
+                             workers: int = 8) -> pd.DataFrame:
+    """
+    過去 5 走の “上がり 3F 順位 & 脚質” を取りまとめて特徴量化。
+      umaban_map : {(race_id, horse_id) : 馬番}
+    """
+    feats = []
+    total = skipped_no_map = failed_parse = 0
+
+    for hid, sub in tqdm_notebook(df_hist.groupby("horse_id"),
+                                  desc="[section] horses"):
+        sub = sub.sort_values("race_date", ascending=False).head(5)
+
+        # ----- race_id & 馬番 が揃うものだけ抽出 ----------------
+        tasks = []
+        for rid in sub["race_id"]:
+            key = (str(rid), str(hid))
+            umaban = umaban_map.get(key)
+            if umaban is not None:
+                tasks.append((rid, umaban))
+        if not tasks:
+            skipped_no_map += 1
+            continue
+
+        total += 1
+        ranks, styles = [], []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {
+                ex.submit(_parse_section, _load_result_html(rid), umaban): rid
+                for rid, umaban in tasks
+            }
+            for f in as_completed(futs):
+                try:
+                    rk, st = f.result()
+                    if rk is not None: ranks.append(rk)
+                    if st is not None: styles.append(st)
+                except Exception:
+                    failed_parse += 1
+
+        if not ranks:
+            continue                                        # ← 上がり無しならスキップ
+
+        arr = np.array(ranks)
+        feats.append(dict(
+            horse_id = hid,
+            past5_section_rank_mean = arr.mean(),
+            past5_section_rank_best = arr.min(),
+            style_mode    = max(set(styles), key=styles.count) if styles else None,
+            style_win_rate= (arr == 1).mean(),
+            style_in3_rate= (arr <= 3).mean()
+        ))
+
+    if not feats:
+        logging.error(f"[section] 全馬処理済={total} / mapなし={skipped_no_map} / "
+                      f"parse失敗={failed_parse}")
+        raise RuntimeError("❌ collect_section_features() → 有効データ 0 件")
+
+    return pd.DataFrame(feats)
+
+
+
+
+# %% 騎手×競走条件適性  ------------------------------------
+def build_jockey_course_stats(df_res: pd.DataFrame) -> pd.DataFrame:
+    df = df_res.copy()
+    df["dist_cat"] = pd.cut(df["distance"],
+                            bins=DIST_CAT_BINS,
+                            labels=DIST_CAT_LABELS)
+    grp = df.groupby(["jockey_id", "dist_cat", "surface"], sort=False)
+    rec = []
+    for (jid, dcat, surf), sub in tqdm_notebook(grp,
+                                               desc="[jockey-course]",
+                                               total=grp.ngroups):
+        fin = sub["着順"].astype(int)
+        rec.append(dict(jockey_id=jid, dist_cat=dcat, surface=surf,
+                        jockey_course_rank_mean=fin.mean(),
+                        jockey_course_in3_rate=(fin <= 3).mean()))
+    return pd.DataFrame(rec)
+
+# %% ラッパー（past5 と同列で保存） ------------------------
+# %% ラッパー（past5 と同列で保存） ------------------------
+PKL_SECTION = DIR_DATA / "df_section.pkl"
+
+def _clean_umaban(series: pd.Series) -> pd.Series:
+    """
+    馬番文字列を正規化して Int64 に変換
+      - 空白・全角スペースを除去
+      - 全角数字→半角数字
+      - 先頭の数字列だけ抽出（例: ' 3 (繰上) ' → 3）
+    """
+    # 先に全角→半角へ一括変換
+    table = str.maketrans("０１２３４５６７８９", "0123456789")
+    s = series.astype(str).str.translate(table)
+
+    # 空白除去 → 数字部分抽出
+    s = s.str.replace(r"\s+", "", regex=True)      # スペース全削除
+    s = s.str.extract(r"(\d+)", expand=False)      # 連続数字を抜き出す
+
+    return pd.to_numeric(s, errors="coerce").astype("Int64")
+
+
+# ============================================================
+# calc_section_features  ― 馬番マップを (race_id, horse_id) へ
+# ============================================================
+def calc_section_features(df_hist: pd.DataFrame,
+                          df_result: pd.DataFrame) -> pd.DataFrame:
+    """
+    区間タイム・脚質特徴量を生成。
+    - 馬番は result.html 由来（race_id+horse_id の完全キー）を使用
+    """
+    # -- 1) 前処理 -------------------------------------------------
+    df_result = (
+        df_result
+          .dropna(subset=["race_id", "horse_id", "馬番"])
+          .assign(race_id=lambda d: d["race_id"].astype(str).str.strip(),
+                  horse_id=lambda d: d["horse_id"].astype(str).str.strip(),
+                  馬番=lambda d: pd.to_numeric(d["馬番"], errors="coerce").astype("Int64"))
+    )
+
+    # -- 2) (race_id, horse_id) → 馬番 辞書 ------------------------
+    umaban_map: dict[tuple[str, str], int] = (
+        df_result.set_index(["race_id", "horse_id"])["馬番"].to_dict()
+    )
+
+    # -- 3) 既存ロジック呼び出し ----------------------------------
+    return collect_section_features(df_hist, umaban_map)
+
+# ============================================================
+# 7. 特徴量生成
+# ============================================================
+# -----------------------------------------------------------
+# calc_section_features  ―  horse ページが欠損しても落ちない版
+# -----------------------------------------------------------
+def calc_section_features(df_hist: pd.DataFrame,
+                          df_result: pd.DataFrame) -> pd.DataFrame:
+    """
+    区間タイム・脚質特徴量を生成。
+    優先: df_hist (horse ページ)  
+    補完: df_result から race_id / horse_id を追加
+    """
+
+    # --------- 1) 足りない race_id を df_result で補完 ------------
+    core_cols = {"horse_id", "race_id", "race_date"}
+    if not core_cols.issubset(df_hist.columns):
+        # df_hist がほぼ空の場合も想定してミニ DF を作る
+        df_hist = df_hist.reindex(columns=list(core_cols)).copy()
+
+    # result から race_date を推定（ない場合は 2100-01-01 にして降順 head(5) が効くように）
+    add_cols = (df_result[["race_id", "horse_id"]]
+                .dropna()
+                .assign(race_date=lambda d:
+                        pd.to_datetime(d["race_id"].str[:8], errors="coerce")
+                        .fillna(pd.Timestamp("2100-01-01"))))
+    df_hist_full = (pd.concat([df_hist[list(core_cols)], add_cols], ignore_index=True)
+                      .drop_duplicates(subset=["horse_id", "race_id"]))
+
+    # --------- 2) umaban_map  (rid, hid) → 馬番 ------------------
+    umaban_map: dict[tuple[str, str], int] = (
+        df_result.dropna(subset=["race_id", "horse_id", "馬番"])
+                 .assign(race_id=lambda d: d["race_id"].astype(str).str.strip(),
+                         horse_id=lambda d: d["horse_id"].astype(str).str.strip(),
+                         馬番=lambda d: pd.to_numeric(d["馬番"], errors="coerce"))
+                 .dropna(subset=["馬番"])
+                 .set_index(["race_id", "horse_id"])["馬番"]
+                 .astype(int)
+                 .to_dict()
+    )
+
+    # --------- 3) 既存ロジック呼び出し ---------------------------
+    return collect_section_features(df_hist_full, umaban_map)
+
+
+
+def calc_jockey_features(df_result: pd.DataFrame) -> pd.DataFrame:
+    tmp = df_result[["jockey_id", "着順"]].dropna()
+    tmp["jockey_id"] = tmp["jockey_id"].astype(str)
+    return (tmp.groupby("jockey_id", as_index=False)
+              .agg(jockey_fukusho=("着順", lambda s: (s <= 3).mean()),
+                   jockey_count  =("着順", "count")))
+
+FEATS = [
+    # --- past5 ---
+    "past5_avg_rank", "past5_avg_3f", "past5_avg_weight",
+    "past5_shiba_ratio",
+    # --- 区間タイム & 脚質 ---
+    "past5_section_rank_mean", "past5_section_rank_best",
+    "style_win_rate", "style_in3_rate",
+    # --- 騎手 ---
+    "jockey_fukusho", "jockey_count",
+    "jockey_course_rank_mean", "jockey_course_in3_rate"]
+
+# ============================================================
+# 8. LightGBM モデル
+# ============================================================
+def train_lightgbm(df: pd.DataFrame):
+    tr = df.sample(frac=0.8, random_state=42)
+    va = df.drop(tr.index)
+    dtr = lgb.Dataset(tr[FEATS], label=(tr["着順"] <= 3).astype(int))
+    dva = lgb.Dataset(va[FEATS], label=(va["着順"] <= 3).astype(int))
+    params = dict(objective="binary", metric="auc", learning_rate=0.05,
+                  num_leaves=31, seed=42)
+    logging.info("[LightGBM] training …")
+    model = lgb.train(params, dtr, 1000, valid_sets=[dtr, dva],
+                      early_stopping_rounds=100, verbose_eval=200)
+    DIR_MODEL.mkdir(exist_ok=True)
+    model.save_model(str(MODEL_FILE), num_iteration=model.best_iteration)
+    logging.info(f"[LightGBM] saved → {MODEL_FILE}")
+    return model
+
+# ============================================================
+# 9. 払戻しパーサ & ROI チェック
+# ============================================================
+def parse_wide_payoffs(path: Path) -> dict[str, int]:
+    """
+    結果 HTML からワイド払戻しを抽出して dict で返す
+      key = '02-05' のように 2 桁ゼロ埋め・昇順
+      val = 払戻し金額（円, int）
+    """
+    if not path.exists():
+        return {}
+
+    soup = BeautifulSoup(path.read_bytes(), "lxml")
+
+    # ------ ① <tr class="Wide"> を優先的に取得 ----------------
+    tr = soup.find("tr", class_=re.compile(r"\bWide\b", re.I))
+    if tr is None:
+        # フォールバック：class 名が無い場合は <div class="Result_Pay_Back">
+        pay_div = soup.find("div", class_=re.compile(r"Result_Pay_Back", re.I))
+        if not pay_div:
+            return {}
+        # ワイド行を探す
+        for cand in pay_div.find_all("tr"):
+            if "ワイド" in cand.get_text():
+                tr = cand
+                break
+        if tr is None:
+            return {}
+
+    text = tr.get_text(" ", strip=True)
+
+    # ------ ② 「数字 数字 金額円」パターンを順に抽出 ----------
+    pattern = r"(\d+)\s+(\d+)\s+(\d{2,7})円"
+    res: dict[str, int] = {}
+    for a, b, pay in re.findall(pattern, text):
+        key = "-".join(sorted([a.zfill(2), b.zfill(2)]))
+        res[key] = int(pay.replace(",", ""))
+    return res
+
+
+def answer_check(df_pred: pd.DataFrame, bet: int = 100):
+    """
+    予測 DataFrame からワイド的中数と ROI を計算
+      - 上位2頭の「馬番」(枠内の出走番号) を買うと仮定
+      - 払戻し辞書は parse_wide_payoffs() で取得
+    """
+    if "馬番" not in df_pred.columns:
+        logging.warning("[答え合わせ] df に '馬番' 列がありません")
+        return
+
+    pays = []
+    for rid, sub in df_pred.groupby("race_id"):
+        # ① スコア上位 2 頭の馬番を取り出す
+        nums = (sub.nlargest(2, "pred_score")["馬番"]
+                   .dropna().astype(int).astype(str)
+                   .str.zfill(2)     # 2 桁ゼロ埋め
+                   .tolist())
+        if len(nums) < 2:
+            continue
+
+        key = "-".join(sorted(nums))         # 例: 02-05
+        pay_dict = parse_wide_payoffs(DIR_HTML_RESULT / f"race_{rid}.bin")
+        pays.append(pay_dict.get(key, 0))
+
+    if not pays:
+        logging.warning("[答え合わせ] 払戻しデータ無し")
+        return
+
+    hit = sum(1 for p in pays if p)
+    roi = sum(pays) / (len(pays) * bet) * 100
+    logging.info(f"[答え合わせ] レース={len(pays)} 的中={hit} ROI={roi:.1f}%")
+
+# %%  TRAIN / PREDICT パイプライン  ------------------------------------
+# %% =========================================================
+#  TRAIN パイプライン  ― Chrome フェーズと多プロセスを完全分離
+# ============================================================
+def train_pipeline():
+    logging.info("=== TRAIN MODE ===")
+    kill_zombie_chrome()                        # 残存プロセス掃除
+
+    # ---------- ① 開催日 → race_id 収集  (Chrome 使用) ----------
+    dates = scrape_kaisai_date_selenium(FROM_YYYMMM, TO_YYYMMM)
+    race_ids = sorted({rid for d in dates for rid in scrape_race_ids_one_day(d)})
+    logging.info(f"[TRAIN] race_id = {len(race_ids):,}")
+
+    # ---------- ② result.html ダウンロード  (Chrome 使用) -------
+    DIR_HTML_RESULT.mkdir(parents=True, exist_ok=True)
+    fetch_result_html_bulk(race_ids, max_workers=16)
+
+    # ---------- ★ Chrome 完全終了 → GC --------------------------
+    kill_zombie_chrome()
+    import gc, time
+    gc.collect(); time.sleep(1)                 # DLL 解放待ち
+    # ------------------------------------------------------------
+
+    # ---------- ③ result.html → DataFrame (多プロセス) ----------
+    df_result, skipped = parse_result_html_bulk_loky(
+        race_ids,
+        DIR_HTML_RESULT,
+        max_workers=max(1, int(os.cpu_count() * CPU_RATIO))
+    )
+    if df_result.empty:
+        logging.error("[TRAIN] result parse 0 件…中断"); return
+    DIR_DATA.mkdir(exist_ok=True)
+    df_result.to_pickle(PKL_RESULT)
+    logging.info(f"[SAVE] df_result → {PKL_RESULT}")
+    if skipped:
+        Path("skipped_result_ids.txt").write_text("\n".join(skipped), encoding="utf-8")
+        logging.info(f"[SAVE] skipped_result_ids.txt ({len(skipped)})")
+
+    # ---------- ④ horse ページ ダウンロード  (Chrome 使用) ------
+    horse_ids = sorted(df_result["horse_id"].dropna()
+                       .astype(str).loc[lambda s: s.str.len() == 10].unique())
+    DIR_HTML_HORSE.mkdir(parents=True, exist_ok=True)
+    scrape_horse_pages_bulk(horse_ids)
+
+    # ---------- ★ 再度 Chrome 完全終了 → GC ----------------------
+    kill_zombie_chrome()
+    gc.collect(); time.sleep(1)
+    # ------------------------------------------------------------
+
+    # ---------- ⑤ horse パース & 特徴量 (多プロセス) ------------
+    df_horse = parse_horse_data_all(
+        horse_ids,
+        max_workers=max(1, int(os.cpu_count() * CPU_RATIO))
+    )
+    df_horse.to_pickle(PKL_HORSE_ALL)
+
+    # ⑤-A 区間タイム・脚質
+    df_section = calc_section_features(df_horse, df_result)
+    df_section.to_pickle(PKL_SECTION)
+
+    print("[DEBUG] df_section columns:", df_section.columns.tolist())
+    print("[DEBUG] df_section shape:", df_section.shape)
+
+    df_section.to_pickle(PKL_SECTION)
+
+    # ⑤-B past5
+    df_p5 = calc_past5_features(df_horse)
+    df_p5.to_pickle(PKL_PAST5)
+
+    # ⑤-C 騎手適性
+    df_jk = calc_jockey_features(df_result)
+    df_jk.to_pickle(PKL_JOCKEY)
+
+    # ---------- ⑥ LightGBM 学習 ----------------------------------
+    df_model = (df_result
+                  .merge(df_p5,     on="horse_id",  how="left")
+                  .merge(df_section,on="horse_id",  how="left")
+                  .merge(df_jk,     on="jockey_id", how="left"))
+
+    model = train_lightgbm(df_model)
+    df_model["pred_score"] = model.predict(df_model[FEATS].fillna(0))
+
+    # ---------- ⑦ ROI チェック -----------------------------------
+    if ANSWER_CHECK_ENABLED:
+        answer_check(df_model)
+
+    logging.info("=== TRAIN 完了 ===")
+
+
+# %% =========================================================
+#  PREDICT パイプライン  ― Chrome フェーズと後続処理を分離
+# ============================================================
+def predict_pipeline():
+    logging.info("=== PREDICT MODE ===")
+
+    # ---------- ① race_id 取得 (Chrome 使用) --------------------
+    rids = scrape_race_ids_one_day(RACE_DATE)
+    if not rids:
+        logging.error(f"[PREDICT] race_id 0 件 ({RACE_DATE})"); return
+
+    # ---------- ② shutuba HTML ダウンロード (Chrome 使用) ------
+    DIR_HTML_RACE.mkdir(parents=True, exist_ok=True)
+    for rid in tqdm_notebook(rids, desc="shutuba html"):
+        ensure_html(
+            path=DIR_HTML_RACE / f"shutuba_{rid}.bin",
+            url=f"https://race.netkeiba.com/race/shutuba.html?race_id={rid}",
+            wait_xpaths=['//*[@class="Shutuba_Table"]'],
+            no_images=True
+        )
+
+    # ---------- ★ Chrome 完全終了 → GC --------------------------
+    kill_zombie_chrome()
+    import gc, time
+    gc.collect(); time.sleep(1)
+    # ------------------------------------------------------------
+
+    # ---------- ③ shutuba 解析 → horse & jockey ID -------------
+    dfs = []
+    for rid in rids:
+        fp = DIR_HTML_RACE / f"shutuba_{rid}.bin"
+        if not fp.exists(): continue
+        soup = BeautifulSoup(fp.read_bytes(), "lxml")
+        tbl  = soup.find("table", class_="Shutuba_Table")
+        if not tbl: continue
+
+        df = pd.read_html(str(tbl))[0]
+
+        # 馬 ID
+        horse_ids = [re.search(r"/horse/(\d+)", a["href"]).group(1)
+                     for a in tbl.find_all("a", href=re.compile(r"/horse/\d+"))]
+
+        # 騎手 ID
+        jockey_ids = []
+        for a in tbl.find_all("a", href=True):
+            m = re.search(r"/jockey/(?:profile/|detail/)?(\d+)", a["href"])
+            jockey_ids.append(m.group(1) if m else None)
+        jockey_ids = jockey_ids[:len(horse_ids)] + [None]*(len(horse_ids)-len(jockey_ids))
+
+        df = df.head(len(horse_ids))
+        df["horse_id"]  = horse_ids
+        df["jockey_id"] = jockey_ids[:len(df)]
+        df["race_id"]   = rid
+        dfs.append(df[["race_id", "horse_id", "jockey_id"]])
+
+    if not dfs:
+        logging.error("[PREDICT] shutuba parse 0"); return
+
+    # ---------- ④ 特徴量結合 ------------------------------------
+    df_pred = pd.concat(dfs, ignore_index=True)
+    df_pred = (df_pred
+               .merge(pd.read_pickle(PKL_PAST5),   on="horse_id",  how="left")
+               .merge(pd.read_pickle(PKL_SECTION), on="horse_id",  how="left")
+               .merge(pd.read_pickle(PKL_JOCKEY),  on="jockey_id", how="left"))
+
+    # ---------- ⑤ 予測 ------------------------------------------
+    model = lgb.Booster(model_file=str(MODEL_FILE))
+    df_pred["pred_score"] = model.predict(df_pred[FEATS].fillna(0))
+
+    DIR_OUTPUT.mkdir(parents=True, exist_ok=True)
+    out = DIR_OUTPUT / f"predict_{RACE_DATE}.csv"
+    df_pred.to_csv(out, index=False, encoding="utf-8-sig")
+    logging.info(f"[SAVE] → {out}")
+
+    # ---------- ⑥ 任意 ROI チェック ------------------------------
+    if ANSWER_CHECK_ENABLED:
+        answer_check(df_pred)
+
+# ============================================================
+# 12. main
+# ============================================================
+def main():
+    train_pipeline() if TRAIN_MODE else predict_pipeline()
+
+if __name__ == "__main__":
+    main()
