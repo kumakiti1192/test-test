@@ -18,3 +18,5 @@ This repository contains a sample script `keiba_analysis.py` for analyzing horse
 ```bash
 python keiba_analysis.py
 ```
+
+`LOGLEVEL` 環境変数に `DEBUG` を指定すると、より詳細なログを出力します。

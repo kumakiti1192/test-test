@@ -37,8 +37,9 @@ import undetected_chromedriver as uc
 
 # -----------------------------------------------
 # ロギング設定
+loglevel = os.getenv("LOGLEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=loglevel,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -365,12 +366,14 @@ def get_race_results_with_odds(rid: str, driver: Optional[uc.Chrome] = None) -> 
 
     html_path = CACHE_RES / f"{rid}.html"
     soup = None
+    logging.debug(f"[RESULT] start fetch {rid}")
 
     if html_path.exists():
         try:
             soup = BeautifulSoup(html_path.read_text(encoding="utf-8"), "lxml")
             logging.info(f"[CACHE] {rid} html loaded")
-        except Exception:
+        except Exception as e:
+            logging.warning(f"[CACHE {rid}] load failed: {e}")
             html_path.unlink(missing_ok=True)
 
     if soup is None:
@@ -381,6 +384,7 @@ def get_race_results_with_odds(rid: str, driver: Optional[uc.Chrome] = None) -> 
                 html_path.write_text(html, encoding="utf-8")
                 logging.info(f"[REQ] {rid} html fetched")
             else:
+                logging.info(f"[REQ] {rid} no table, will fallback")
                 soup = None
         except Exception as e:
             logging.warning(f"[REQ {rid}] {e}")
@@ -391,6 +395,7 @@ def get_race_results_with_odds(rid: str, driver: Optional[uc.Chrome] = None) -> 
         if driver is None:
             driver = prepare_chrome_driver(headless=True, no_images=True)
             close_driver = True
+        logging.info(f"[SEL] fetching {rid} via Selenium")
         ok = safe_driver_get(
             driver,
             url,
@@ -399,6 +404,7 @@ def get_race_results_with_odds(rid: str, driver: Optional[uc.Chrome] = None) -> 
             timeout=90,
         )
         if not ok:
+            logging.error(f"[SEL] failed to fetch {rid}")
             if close_driver:
                 driver.quit()
             return {"order": []}
@@ -407,10 +413,12 @@ def get_race_results_with_odds(rid: str, driver: Optional[uc.Chrome] = None) -> 
         if close_driver:
             driver.quit()
 
-    order = [
-        int(tr.find_all("td")[2].get_text(strip=True))
-        for tr in soup.select(".RaceTable01 tr")[1:4]
-    ]
+    trs = soup.select(".RaceTable01 tr")
+    if len(trs) < 4:
+        logging.error(f"[PARSE] {rid} not enough rows: {len(trs)}")
+        return {"order": []}
+    order = [int(tr.find_all("td")[2].get_text(strip=True)) for tr in trs[1:4]]
+    logging.info(f"[ORDER] {rid} {order}")
     payout = parse_payout_table(soup)
     return {"order": order, **payout}
 
@@ -490,27 +498,33 @@ def evaluate_bet(bet_type: str, nums: Tuple, result: Dict[str, Any]) -> int:
     if not order:
         return 0
     if bet_type == "単勝":
-        return (
-            result["tansho"].get(nums[0], 0) * BET_UNIT // 100
-            if nums[0] == order[0]
-            else 0
-        )
+        pay = result["tansho"].get(nums[0], 0) * BET_UNIT // 100 if nums[0] == order[0] else 0
+        logging.debug(f"[BET] {bet_type} {nums} -> {pay}")
+        return pay
     if bet_type == "複勝":
-        return (
-            result["fukusho"].get(nums[0], 0) * BET_UNIT // 100
-            if nums[0] in order[:3]
-            else 0
-        )
+        pay = result["fukusho"].get(nums[0], 0) * BET_UNIT // 100 if nums[0] in order[:3] else 0
+        logging.debug(f"[BET] {bet_type} {nums} -> {pay}")
+        return pay
     if bet_type == "馬連":
-        return result["umaren"].get(tuple(sorted(nums)), 0) * BET_UNIT // 100
+        pay = result["umaren"].get(tuple(sorted(nums)), 0) * BET_UNIT // 100
+        logging.debug(f"[BET] {bet_type} {nums} -> {pay}")
+        return pay
     if bet_type == "馬単":
-        return result["umatan"].get(nums, 0) * BET_UNIT // 100
+        pay = result["umatan"].get(nums, 0) * BET_UNIT // 100
+        logging.debug(f"[BET] {bet_type} {nums} -> {pay}")
+        return pay
     if bet_type == "ワイド":
-        return result["wide"].get(tuple(sorted(nums)), 0) * BET_UNIT // 100
+        pay = result["wide"].get(tuple(sorted(nums)), 0) * BET_UNIT // 100
+        logging.debug(f"[BET] {bet_type} {nums} -> {pay}")
+        return pay
     if bet_type == "三連複":
-        return result["sanrenpuku"].get(tuple(sorted(nums)), 0) * BET_UNIT // 100
+        pay = result["sanrenpuku"].get(tuple(sorted(nums)), 0) * BET_UNIT // 100
+        logging.debug(f"[BET] {bet_type} {nums} -> {pay}")
+        return pay
     if bet_type == "三連単":
-        return result["sanrentan"].get(nums, 0) * BET_UNIT // 100
+        pay = result["sanrentan"].get(nums, 0) * BET_UNIT // 100
+        logging.debug(f"[BET] {bet_type} {nums} -> {pay}")
+        return pay
     return 0
 
 
@@ -533,13 +547,18 @@ def process_one_date(date: str, files: List[Path]) -> pd.DataFrame:
             if row["印"] in MARK_ORDER
         }
         bets = generate_bets(marks)
+        logging.info(f"[RACE] processing {rid} ({place} {r}R)")
         result = get_race_results_with_odds(rid, driver=driver)
+        hit_count = 0
         for bname, blist in bets.items():
             for btype, nums in blist:
                 pay = evaluate_bet(btype, nums, result)
+                hit = int(pay > 0)
+                hit_count += hit
                 recs.append(
-                    dict(日付=date, 券種=bname, 的中=int(pay > 0), 購入=BET_UNIT, 払戻=pay)
+                    dict(日付=date, 券種=bname, 的中=hit, 購入=BET_UNIT, 払戻=pay)
                 )
+        logging.info(f"[RACE] {rid} bets={sum(len(v) for v in bets.values())} hits={hit_count}")
     driver.quit()
     logging.info(f"[RECS] {date}: {len(recs)} 行")
     return pd.DataFrame(recs)
