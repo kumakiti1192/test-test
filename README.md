@@ -20,3 +20,6 @@ python keiba_analysis.py
 ```
 
 `LOGLEVEL` 環境変数に `DEBUG` を指定すると、より詳細なログを出力します。
+
+取得した結果ページの HTML は `cache/results` 以下に保存されます。すでに
+キャッシュが存在する場合はネットワークアクセスなしで再利用されます。

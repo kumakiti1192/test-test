@@ -150,6 +150,32 @@ def safe_driver_get(
     max_retry: int = 3,
     use_network_idle: bool = True,
 ) -> bool:
+    """Load the given URL with retries.
+
+    Parameters
+    ----------
+    driver : WebDriver
+        Selenium ドライバ
+    url : str
+        取得対象の URL
+    wait_xpath : str | None, default None
+        ページ表示完了を判定する要素の XPath
+    timeout : int, default 45
+        ロード完了を待つ秒数
+    quiet_sec : int, default 2
+        ``use_network_idle`` が ``True`` の場合に
+        ネットワークが静かになるまで待つ秒数
+    max_retry : int, default 3
+        リトライ回数
+    use_network_idle : bool, default True
+        ページ表示後に ``NETWORK_IDLE_JS`` を実行して
+        通信が止まるまで待つかどうか
+
+    Returns
+    -------
+    bool
+        成功した場合 ``True``
+    """
     for att in range(1, max_retry + 1):
         try:
             driver.set_page_load_timeout(timeout)
